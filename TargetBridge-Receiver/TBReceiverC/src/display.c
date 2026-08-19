@@ -9,6 +9,7 @@
 #include "display.h"
 #include "tb_i18n.h"
 #include "tb_gesture_bridge.h"
+#include "tb_native_metal_renderer.h"
 
 #include <CoreFoundation/CoreFoundation.h>
 #include <CoreGraphics/CoreGraphics.h>
@@ -19,6 +20,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 
 #ifndef TB_RECEIVER_VERSION
 #define TB_RECEIVER_VERSION "3.5.2"
@@ -27,6 +29,8 @@
 #ifndef TB_RECEIVER_BUILD
 #define TB_RECEIVER_BUILD "dev"
 #endif
+
+static int tb_disp_effective_cursor_large(const struct tb_display *d);
 
 struct tb_display {
     SDL_Window   *win;
@@ -60,6 +64,13 @@ struct tb_display {
     uint64_t      cursor_wait_sum_ms;
     uint64_t      cursor_wait_max_ms;
     uint32_t      last_video_frame_time;
+#if defined(__APPLE__)
+    int           metal_native_enabled;
+    int           metal_native_failed_logged;
+    void         *native_metal_renderer;
+    uint32_t      native_stats_tick;
+    struct tb_native_metal_stats native_stats_previous;
+#endif
     int           system_cursor_hidden;
 
     char          last_ip[64];
@@ -546,6 +557,12 @@ static SDL_Renderer *tb_disp_create_accelerated_renderer(SDL_Window *win) {
     const char *forced_driver = getenv("TB_RECEIVER_RENDER_DRIVER");
     if (forced_driver && forced_driver[0] != '\0') {
         fprintf(stderr, "[disp] renderer override = %s\n", forced_driver);
+        /* The native path owns only the video overlay. SDL/OpenGL remains
+         * underneath for the waiting screen, controls and input loop. */
+        if (strcasecmp(forced_driver, "metal-native") == 0 ||
+            strcasecmp(forced_driver, "native-metal") == 0) {
+            return tb_disp_try_renderer(win, "opengl");
+        }
         return tb_disp_try_renderer(win, forced_driver);
     }
 
@@ -595,11 +612,32 @@ struct tb_display *tb_disp_create(int fullscreen) {
     SDL_SetYUVConversionMode(SDL_YUV_CONVERSION_BT709);
     SDL_RenderSetLogicalSize(d->ren, 0, 0);
 
-    /* report which backend SDL picked */
+    /* Report which backend SDL picked and enable the experimental direct
+     * CAMetalLayer path only when explicitly requested. */
     SDL_RendererInfo info;
     if (SDL_GetRendererInfo(d->ren, &info) == 0) {
         fprintf(stderr, "[disp] renderer = %s\n", info.name);
     }
+#if defined(__APPLE__)
+    const char *forced_driver = getenv("TB_RECEIVER_RENDER_DRIVER");
+    const int native_requested = forced_driver &&
+        (strcasecmp(forced_driver, "metal-native") == 0 ||
+         strcasecmp(forced_driver, "native-metal") == 0);
+    if (native_requested) {
+        const char *zero_copy = getenv("TB_RECEIVER_METAL_ZERO_COPY");
+        const int disabled = zero_copy &&
+            (strcmp(zero_copy, "0") == 0 ||
+             strcasecmp(zero_copy, "false") == 0 ||
+             strcasecmp(zero_copy, "off") == 0);
+        if (!disabled) d->native_metal_renderer = tb_native_metal_create();
+        if (!disabled && d->native_metal_renderer) {
+            d->metal_native_enabled = 1;
+            fprintf(stderr, "[disp] native Metal CAMetalLayer path enabled\n");
+        } else if (!disabled) {
+            fprintf(stderr, "[disp] native Metal unavailable; using OpenGL NV12 upload\n");
+        }
+    }
+#endif
 
     int win_w = 0, win_h = 0, out_w = 0, out_h = 0;
     SDL_GetWindowSize(d->win, &win_w, &win_h);
@@ -665,6 +703,12 @@ void tb_disp_destroy(struct tb_display *d) {
         CGDisplayShowCursor(CGMainDisplayID());
         d->system_cursor_hidden = 0;
     }
+#if defined(__APPLE__)
+    if (d->native_metal_renderer) {
+        tb_native_metal_destroy(d->native_metal_renderer);
+        d->native_metal_renderer = NULL;
+    }
+#endif
     tb_disp_destroy_status_texture(d);
     if (d->tex) SDL_DestroyTexture(d->tex);
     if (d->ren) SDL_DestroyRenderer(d->ren);
@@ -780,9 +824,7 @@ static void tb_disp_draw_cursor(struct tb_display *d) {
     const double sy = (double)out_h / (double)d->cursor_source_h;
     const int x = (int)((double)d->cursor_x * sx);
     const int y = (int)((double)d->cursor_y * sy);
-    const int large = d->cursor_size_mode == 1 ? 0
-                    : d->cursor_size_mode == 2 ? 1
-                    : d->cursor_large;
+    const int large = tb_disp_effective_cursor_large(d);
     const int size = large
         ? (out_w >= 5000 ? 58 : 44)
         : (out_w >= 5000 ? 32 : 24);
@@ -1153,6 +1195,13 @@ static void tb_disp_draw_cursor(struct tb_display *d) {
     SDL_SetRenderDrawBlendMode(d->ren, old_blend);
 }
 
+/* Overlay size actually drawn: TB_RECEIVER_CURSOR_SIZE overrides the sender flag. */
+static int tb_disp_effective_cursor_large(const struct tb_display *d) {
+    if (d->cursor_size_mode == 1) return 0;
+    if (d->cursor_size_mode == 2) return 1;
+    return d->cursor_large;
+}
+
 static void tb_disp_render_current(struct tb_display *d) {
     if (!d || !d->tex) return;
     SDL_RenderClear(d->ren);
@@ -1167,6 +1216,14 @@ void tb_disp_render_nv12(struct tb_display *d,
                          const uint8_t *y, int y_stride,
                          const uint8_t *uv, int uv_stride,
                          int w, int h) {
+#if defined(__APPLE__)
+    if (d && d->native_metal_renderer) {
+        /* RAW/software-decoded frames have no IOSurface to wrap. Expose the
+         * proven SDL/OpenGL fallback instead of leaving a stale Metal frame
+         * above it. */
+        tb_native_metal_set_visible(d->native_metal_renderer, 0);
+    }
+#endif
     if (tb_disp_ensure_texture(d, w, h) < 0) return;
     tb_disp_set_connection_state(d, 1);
 
@@ -1178,6 +1235,74 @@ void tb_disp_render_nv12(struct tb_display *d,
     }
     d->last_video_frame_time = SDL_GetTicks();
     tb_disp_render_current(d);
+}
+
+#if defined(__APPLE__)
+static void tb_disp_log_native_stats(struct tb_display *d) {
+    const uint32_t now = SDL_GetTicks();
+    if (d->native_stats_tick != 0 && now - d->native_stats_tick < 1000) return;
+
+    struct tb_native_metal_stats stats;
+    tb_native_metal_get_stats(d->native_metal_renderer, &stats);
+    const uint64_t completed =
+        stats.completed_frames - d->native_stats_previous.completed_frames;
+    const uint64_t submitted =
+        stats.submitted_frames - d->native_stats_previous.submitted_frames;
+    const uint64_t dropped =
+        stats.dropped_frames - d->native_stats_previous.dropped_frames;
+    const double gpuTotal =
+        stats.gpu_time_ms_total - d->native_stats_previous.gpu_time_ms_total;
+    fprintf(stderr,
+            "[metal-native-perf] submitted=%llu completed=%llu dropped=%llu "
+            "gpuAvg=%.3fms gpuMax=%.3fms\n",
+            (unsigned long long)submitted,
+            (unsigned long long)completed,
+            (unsigned long long)dropped,
+            completed ? gpuTotal / (double)completed : 0.0,
+            stats.gpu_time_ms_max);
+    d->native_stats_previous = stats;
+    d->native_stats_tick = now;
+}
+#endif
+
+int tb_disp_render_native_nv12(struct tb_display *d,
+                               void *pixel_buffer,
+                               int w, int h) {
+#if defined(__APPLE__)
+    if (!d || !pixel_buffer || !d->metal_native_enabled ||
+        !d->native_metal_renderer) return 0;
+
+    tb_disp_set_connection_state(d, 1);
+    const int result = tb_native_metal_render_nv12(
+        d->native_metal_renderer, pixel_buffer,
+        d->cursor_x, d->cursor_y,
+        d->cursor_source_w, d->cursor_source_h,
+        d->cursor_visible, d->cursor_type,
+        tb_disp_effective_cursor_large(d));
+    if (result >= 0) {
+        d->last_video_frame_time = SDL_GetTicks();
+        d->last_present_ms = SDL_GetTicks64();
+        d->cursor_dirty = 0;
+        tb_disp_log_native_stats(d);
+        (void)w;
+        (void)h;
+        return 1;
+    }
+
+    d->metal_native_enabled = 0;
+    tb_native_metal_set_visible(d->native_metal_renderer, 0);
+    if (!d->metal_native_failed_logged) {
+        d->metal_native_failed_logged = 1;
+        fprintf(stderr,
+                "[disp] native Metal frame failed; falling back to OpenGL NV12 upload\n");
+    }
+#else
+    (void)d;
+    (void)pixel_buffer;
+    (void)w;
+    (void)h;
+#endif
+    return 0;
 }
 
 void tb_disp_set_cursor(struct tb_display *d,
@@ -1205,10 +1330,38 @@ void tb_disp_set_cursor(struct tb_display *d,
 }
 
 void tb_disp_present_cursor_if_dirty(struct tb_display *d) {
-    if (!d || !d->cursor_dirty || !d->is_connected || !d->tex) return;
+    if (!d || !d->cursor_dirty || !d->is_connected) return;
     const uint64_t now = SDL_GetTicks64();
     if (now - d->last_present_ms < d->cursor_min_present_ms) return;
     const uint64_t waited = now - d->cursor_dirty_since_ms;
+#if defined(__APPLE__)
+    if (d->metal_native_enabled && d->native_metal_renderer) {
+        /* Re-composite the retained Metal frame with the new cursor position. */
+        const int result = tb_native_metal_render_cursor(
+            d->native_metal_renderer,
+            d->cursor_x, d->cursor_y,
+            d->cursor_source_w, d->cursor_source_h,
+            d->cursor_visible, d->cursor_type,
+            tb_disp_effective_cursor_large(d));
+        if (result < 0) {
+            d->metal_native_enabled = 0;
+            tb_native_metal_set_visible(d->native_metal_renderer, 0);
+            if (!d->metal_native_failed_logged) {
+                d->metal_native_failed_logged = 1;
+                fprintf(stderr,
+                        "[disp] native Metal cursor present failed; falling back to OpenGL NV12 upload\n");
+            }
+            return;
+        }
+        d->last_present_ms = now;
+        d->cursor_dirty = 0;
+        d->cursor_presents++;
+        d->cursor_wait_sum_ms += waited;
+        if (waited > d->cursor_wait_max_ms) d->cursor_wait_max_ms = waited;
+        return;
+    }
+#endif
+    if (!d->tex) return;
     tb_disp_render_current(d);
     d->cursor_presents++;
     d->cursor_wait_sum_ms += waited;
@@ -1432,6 +1585,11 @@ static void tb_disp_set_stream_state(struct tb_display *d, int connected, int co
     if (d->is_connected == connected && d->is_connecting == connecting) return;
     d->is_connected = connected;
     d->is_connecting = connecting;
+#if defined(__APPLE__)
+    if (!connected && d->native_metal_renderer) {
+        tb_native_metal_set_visible(d->native_metal_renderer, 0);
+    }
+#endif
     tb_disp_refresh_window_mode(d);
 }
 
