@@ -50,6 +50,15 @@ struct tb_display {
     int           cursor_visible;
     int           cursor_type;
     int           cursor_large;
+    /* Low-latency cursor overlay presentation (see tb_disp_present_cursor_if_dirty). */
+    int           cursor_size_mode;      /* 0 = follow packet (upstream), 1 = normal, 2 = large */
+    int           cursor_dirty;
+    uint64_t      cursor_dirty_since_ms;
+    uint64_t      last_present_ms;
+    uint32_t      cursor_min_present_ms;
+    uint64_t      cursor_presents;
+    uint64_t      cursor_wait_sum_ms;
+    uint64_t      cursor_wait_max_ms;
     uint32_t      last_video_frame_time;
     int           system_cursor_hidden;
 
@@ -618,6 +627,33 @@ struct tb_display *tb_disp_create(int fullscreen) {
     d->system_cursor_hidden = 0;
     d->last_video_frame_time = 0;
 
+    /* Cursor overlay tuning. TB_RECEIVER_CURSOR_SIZE forces the overlay size
+     * regardless of the sender's `large` flag (the sender only starts the
+     * low-latency cursor channel when its Large Cursor option is on, so a
+     * receiver may want the channel without the size). */
+    d->cursor_size_mode = 0;
+    {
+        const char *size_env = getenv("TB_RECEIVER_CURSOR_SIZE");
+        if (size_env && strcmp(size_env, "normal") == 0) d->cursor_size_mode = 1;
+        else if (size_env && strcmp(size_env, "large") == 0) d->cursor_size_mode = 2;
+        if (d->cursor_size_mode) fprintf(stderr, "[disp] cursor size override = %s\n", size_env);
+    }
+    d->cursor_min_present_ms = 16;
+    {
+        const char *interval_env = getenv("TB_RECEIVER_CURSOR_MIN_PRESENT_MS");
+        if (interval_env && interval_env[0] != '\0') {
+            long v = strtol(interval_env, NULL, 10);
+            if (v >= 0 && v <= 1000) d->cursor_min_present_ms = (uint32_t)v;
+        }
+    }
+    fprintf(stderr, "[disp] cursor overlay min present interval = %u ms\n", d->cursor_min_present_ms);
+    d->cursor_dirty = 0;
+    d->cursor_dirty_since_ms = 0;
+    d->last_present_ms = 0;
+    d->cursor_presents = 0;
+    d->cursor_wait_sum_ms = 0;
+    d->cursor_wait_max_ms = 0;
+
     tb_disp_refresh_window_mode(d);
     SDL_ShowWindow(d->win);
     return d;
@@ -744,7 +780,10 @@ static void tb_disp_draw_cursor(struct tb_display *d) {
     const double sy = (double)out_h / (double)d->cursor_source_h;
     const int x = (int)((double)d->cursor_x * sx);
     const int y = (int)((double)d->cursor_y * sy);
-    const int size = d->cursor_large
+    const int large = d->cursor_size_mode == 1 ? 0
+                    : d->cursor_size_mode == 2 ? 1
+                    : d->cursor_large;
+    const int size = large
         ? (out_w >= 5000 ? 58 : 44)
         : (out_w >= 5000 ? 32 : 24);
     SDL_BlendMode old_blend = SDL_BLENDMODE_NONE;
@@ -1120,6 +1159,8 @@ static void tb_disp_render_current(struct tb_display *d) {
     SDL_RenderCopy(d->ren, d->tex, NULL, NULL);
     tb_disp_draw_cursor(d);
     SDL_RenderPresent(d->ren);
+    d->last_present_ms = SDL_GetTicks64();
+    d->cursor_dirty = 0;
 }
 
 void tb_disp_render_nv12(struct tb_display *d,
@@ -1154,12 +1195,39 @@ void tb_disp_set_cursor(struct tb_display *d,
     d->cursor_type = type;
     d->cursor_large = large;
 
-    uint32_t now = SDL_GetTicks();
-    if (now - d->last_video_frame_time > 40) {
-        if (d->is_connected && d->tex) {
-            tb_disp_render_current(d);
-        }
+    /* Do not present here: this runs inside the socket drain loop, where a
+     * present would delay the remaining reads and show intermediate positions
+     * of the same batch. Mark dirty; the main loop presents once per pass. */
+    if (!d->cursor_dirty) {
+        d->cursor_dirty = 1;
+        d->cursor_dirty_since_ms = SDL_GetTicks64();
     }
+}
+
+void tb_disp_present_cursor_if_dirty(struct tb_display *d) {
+    if (!d || !d->cursor_dirty || !d->is_connected || !d->tex) return;
+    const uint64_t now = SDL_GetTicks64();
+    if (now - d->last_present_ms < d->cursor_min_present_ms) return;
+    const uint64_t waited = now - d->cursor_dirty_since_ms;
+    tb_disp_render_current(d);
+    d->cursor_presents++;
+    d->cursor_wait_sum_ms += waited;
+    if (waited > d->cursor_wait_max_ms) d->cursor_wait_max_ms = waited;
+}
+
+int tb_disp_take_cursor_stats(struct tb_display *d,
+                              uint64_t *presents,
+                              uint64_t *avg_wait_ms,
+                              uint64_t *max_wait_ms) {
+    if (!d) return 0;
+    const uint64_t n = d->cursor_presents;
+    if (presents) *presents = n;
+    if (avg_wait_ms) *avg_wait_ms = n ? d->cursor_wait_sum_ms / n : 0;
+    if (max_wait_ms) *max_wait_ms = d->cursor_wait_max_ms;
+    d->cursor_presents = 0;
+    d->cursor_wait_sum_ms = 0;
+    d->cursor_wait_max_ms = 0;
+    return n > 0;
 }
 
 unsigned int tb_disp_poll_actions(struct tb_display *d) {

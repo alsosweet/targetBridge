@@ -2140,6 +2140,12 @@ int main(int argc, char **argv) {
             }
         }
 
+        /* Low-latency cursor: present pending cursor moves once per pass,
+         * after the drain so a batch of packets costs a single present. */
+        if (a.client_fd >= 0 && a.have_video_frame) {
+            tb_disp_present_cursor_if_dirty(a.disp);
+        }
+
         if (t - a.last_permissions_poll_ms >= 250) {
             a.last_permissions_poll_ms = t;
             tb_receiver_poll_permissions(&a);
@@ -2234,7 +2240,19 @@ int main(int argc, char **argv) {
             uint64_t df = a.frames - a.last_fps_count;
             a.last_fps_count   = a.frames;
             a.last_fps_tick_ms = t;
-            if (df > 0) fprintf(stderr, "[main] %llu fps\n", (unsigned long long)df);
+            if (df > 0) {
+                uint64_t cursor_presents = 0, cursor_avg = 0, cursor_max = 0;
+                if (tb_disp_take_cursor_stats(a.disp, &cursor_presents, &cursor_avg, &cursor_max)) {
+                    fprintf(stderr,
+                            "[main] %llu fps, %llu cursor presents (wait avg %llu ms, max %llu ms)\n",
+                            (unsigned long long)df,
+                            (unsigned long long)cursor_presents,
+                            (unsigned long long)cursor_avg,
+                            (unsigned long long)cursor_max);
+                } else {
+                    fprintf(stderr, "[main] %llu fps\n", (unsigned long long)df);
+                }
+            }
         }
 
         /* Yield when idle or when a nonblocking active socket had no data,

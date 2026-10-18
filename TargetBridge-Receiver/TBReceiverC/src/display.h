@@ -56,6 +56,19 @@ void tb_disp_set_cursor(struct tb_display *d,
                         int type,
                         int large);
 
+/* Present the current frame again with the latest cursor position if a cursor
+ * update arrived since the last present. Rate-limited to the configured
+ * minimum present interval; reuses the uploaded texture. Call once per main
+ * loop pass, outside the socket drain. */
+void tb_disp_present_cursor_if_dirty(struct tb_display *d);
+
+/* Fetch and reset cursor-present counters (count, avg/max ms between a cursor
+ * update arriving and its present). Returns nonzero if count > 0. */
+int  tb_disp_take_cursor_stats(struct tb_display *d,
+                               uint64_t *presents,
+                               uint64_t *avg_wait_ms,
+                               uint64_t *max_wait_ms);
+
 void tb_disp_set_brightness(struct tb_display *d, double level);
 
 /* Poll input actions while idle/connected. */
