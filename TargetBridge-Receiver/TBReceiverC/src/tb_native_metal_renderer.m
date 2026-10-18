@@ -31,14 +31,17 @@
 
 @end
 
+/* Cursor overlay: the receiver draws the sender-reported cursor type with the
+ * matching native macOS cursor image (rendered once at 2x into a texture),
+ * composited in the same pass as the video. */
+#define TB_CURSOR_TYPE_COUNT 9
+
 typedef struct {
     vector_float2 drawableSize;
-    vector_float2 cursorPosition;
-    vector_float2 cursorSize;
+    vector_float2 cursorOrigin;   /* top-left of the cursor image, drawable px */
+    vector_float2 cursorExtent;   /* size of the cursor image, drawable px */
     uint32_t cursorVisible;
-    uint32_t cursorType;
     uint32_t fullRange;
-    uint32_t cursorLarge;
 } TBNativeMetalUniforms;
 
 static const char TBNativeMetalShader[] = R"METAL(
@@ -52,12 +55,10 @@ struct RasterData {
 
 struct Uniforms {
     float2 drawableSize;
-    float2 cursorPosition;
-    float2 cursorSize;
+    float2 cursorOrigin;
+    float2 cursorExtent;
     uint cursorVisible;
-    uint cursorType;
     uint fullRange;
-    uint cursorLarge;
 };
 
 vertex RasterData tbVideoVertex(uint vertexID [[vertex_id]]) {
@@ -79,21 +80,10 @@ vertex RasterData tbVideoVertex(uint vertexID [[vertex_id]]) {
     return out;
 }
 
-static bool tbArrowMask(float2 p, float expansion) {
-    const bool head = p.x >= -expansion &&
-                      p.y >= -expansion &&
-                      p.y <= 31.0 + expansion &&
-                      p.x <= p.y * 0.61 + 2.0 + expansion;
-    const bool stem = p.x >= 7.0 - expansion &&
-                      p.x <= 14.0 + expansion &&
-                      p.y >= 21.0 - expansion &&
-                      p.y <= 41.0 + expansion;
-    return head || stem;
-}
-
 fragment float4 tbVideoFragment(RasterData in [[stage_in]],
                                 texture2d<float, access::sample> luma [[texture(0)]],
                                 texture2d<float, access::sample> chroma [[texture(1)]],
+                                texture2d<float, access::sample> cursorImage [[texture(2)]],
                                 constant Uniforms &uniforms [[buffer(0)]]) {
     constexpr sampler linearSampler(coord::normalized,
                                     address::clamp_to_edge,
@@ -115,12 +105,16 @@ fragment float4 tbVideoFragment(RasterData in [[stage_in]],
     rgb = clamp(rgb, 0.0, 1.0);
 
     if (uniforms.cursorVisible != 0) {
-        float2 scale = max(uniforms.cursorSize / float2(24.0, 42.0), float2(0.01));
-        float2 cursorPoint = (in.position.xy - uniforms.cursorPosition) / scale;
-        /* Match the normal macOS-style overlay used by the OpenGL path:
-         * white outline with a dark body. */
-        if (tbArrowMask(cursorPoint, 1.7)) rgb = float3(0.98);
-        if (tbArrowMask(cursorPoint, 0.0)) rgb = float3(0.03);
+        constexpr sampler cursorSampler(coord::normalized,
+                                        address::clamp_to_edge,
+                                        filter::linear);
+        float2 p = (in.position.xy - uniforms.cursorOrigin) /
+                   max(uniforms.cursorExtent, float2(1.0));
+        if (all(p >= 0.0) && all(p <= 1.0)) {
+            /* Premultiplied RGBA cursor image over the video. */
+            float4 c = cursorImage.sample(cursorSampler, p);
+            rgb = c.rgb + rgb * (1.0 - c.a);
+        }
     }
 
     return float4(rgb, 1.0);
@@ -173,6 +167,81 @@ static BOOL tb_pixel_buffer_uses_display_p3(CVPixelBufferRef pixelBuffer) {
     struct tb_native_metal_stats _stats;
     BOOL _loggedFirstFrame;
     BOOL _displayP3;
+    BOOL _cursorTexturesBuilt;
+    id<MTLTexture> _cursorTextures[TB_CURSOR_TYPE_COUNT];
+    NSSize _cursorPointSizes[TB_CURSOR_TYPE_COUNT];
+    NSPoint _cursorHotspots[TB_CURSOR_TYPE_COUNT];
+}
+
+/* Sender cursor type ids (TBDisplaySenderService.swift): 0 arrow, 1 I-beam,
+ * 2 pointing hand, 3 horizontal resize, 4 vertical resize, 5 closed/open hand,
+ * 6 crosshair. 7/8 are reserved; they fall back to the arrow. */
+static NSCursor *tb_native_cursor_for_type(int type) {
+    switch (type) {
+    case 1: return [NSCursor IBeamCursor];
+    case 2: return [NSCursor pointingHandCursor];
+    case 3: return [NSCursor resizeLeftRightCursor];
+    case 4: return [NSCursor resizeUpDownCursor];
+    case 5: return [NSCursor closedHandCursor];
+    case 6: return [NSCursor crosshairCursor];
+    case 7: return [NSCursor openHandCursor];
+    default: return [NSCursor arrowCursor];
+    }
+}
+
+/* Render each native cursor image once at 2x into an RGBA8 texture
+ * (premultiplied alpha, top row first) and remember its point size and hot spot. */
+- (void)buildCursorTexturesIfNeeded {
+    if (_cursorTexturesBuilt || !_device) return;
+    _cursorTexturesBuilt = YES;
+    const CGFloat scale = 2.0;
+    CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
+    int built = 0;
+    for (int type = 0; type < TB_CURSOR_TYPE_COUNT; type++) {
+        NSCursor *cursor = tb_native_cursor_for_type(type);
+        NSImage *image = cursor.image;
+        const NSSize pointSize = image.size;
+        if (!image || pointSize.width <= 0 || pointSize.height <= 0) continue;
+        const size_t width = (size_t)ceil(pointSize.width * scale);
+        const size_t height = (size_t)ceil(pointSize.height * scale);
+        CGContextRef ctx = CGBitmapContextCreate(NULL, width, height, 8, width * 4, colorSpace,
+                                                 kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big);
+        if (!ctx) continue;
+        CGContextClearRect(ctx, CGRectMake(0, 0, width, height));
+        CGContextScaleCTM(ctx, scale, scale); /* lets NSImage pick its @2x representation */
+        NSGraphicsContext *gc = [NSGraphicsContext graphicsContextWithCGContext:ctx flipped:NO];
+        [NSGraphicsContext saveGraphicsState];
+        [NSGraphicsContext setCurrentContext:gc];
+        [image drawInRect:NSMakeRect(0, 0, pointSize.width, pointSize.height)
+                 fromRect:NSZeroRect
+                operation:NSCompositingOperationSourceOver
+                 fraction:1.0
+           respectFlipped:YES
+                    hints:@{ NSImageHintInterpolation: @(NSImageInterpolationHigh) }];
+        [NSGraphicsContext restoreGraphicsState];
+
+        MTLTextureDescriptor *desc =
+            [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                                               width:width
+                                                              height:height
+                                                           mipmapped:NO];
+        desc.usage = MTLTextureUsageShaderRead;
+        id<MTLTexture> texture = [_device newTextureWithDescriptor:desc];
+        if (texture) {
+            [texture replaceRegion:MTLRegionMake2D(0, 0, width, height)
+                       mipmapLevel:0
+                         withBytes:CGBitmapContextGetData(ctx)
+                       bytesPerRow:width * 4];
+            _cursorTextures[type] = texture;
+            _cursorPointSizes[type] = pointSize;
+            _cursorHotspots[type] = cursor.hotSpot;
+            built++;
+        }
+        CGContextRelease(ctx);
+    }
+    CGColorSpaceRelease(colorSpace);
+    fprintf(stderr, "[metal-native] cursor textures built: %d/%d native shapes\n",
+            built, TB_CURSOR_TYPE_COUNT);
 }
 
 - (instancetype)initRenderer {
@@ -446,20 +515,28 @@ static BOOL tb_pixel_buffer_uses_display_p3(CVPixelBufferRef pixelBuffer) {
                                                 (float)drawableSize.height};
         const float sourceWidth = (float)MAX(1, cursorWidth);
         const float sourceHeight = (float)MAX(1, cursorHeight);
-        uniforms.cursorPosition = (vector_float2){
-            (float)cursorX * (float)drawableSize.width / sourceWidth,
-            (float)cursorY * (float)drawableSize.height / sourceHeight
+        const float hotX = (float)cursorX * (float)drawableSize.width / sourceWidth;
+        const float hotY = (float)cursorY * (float)drawableSize.height / sourceHeight;
+
+        [self buildCursorTexturesIfNeeded];
+        int type = (cursorType >= 0 && cursorType < TB_CURSOR_TYPE_COUNT) ? cursorType : 0;
+        if (!_cursorTextures[type]) type = 0;
+        id<MTLTexture> cursorTexture = _cursorTextures[type];
+        /* Native size: one cursor point = one screen point (drawable px per
+         * point from the view's backing scale). Large = 1.8x, like the
+         * sender's accessibility option. */
+        const float pointsToPx = (_view.bounds.size.width > 0.0)
+            ? (float)(drawableSize.width / _view.bounds.size.width) : 2.0f;
+        const float drawScale = pointsToPx * (cursorLarge ? 1.8f : 1.0f);
+        uniforms.cursorOrigin = (vector_float2){
+            hotX - (float)_cursorHotspots[type].x * drawScale,
+            hotY - (float)_cursorHotspots[type].y * drawScale
         };
-        /* Use drawable pixels, not backingScale. Multiplying by Retina scale
-         * made the Metal cursor twice the size of the author's OpenGL fix. */
-        const float cursorBase = drawableSize.width >= 5000.0
-            ? (cursorLarge ? 58.0f : 32.0f)
-            : (cursorLarge ? 44.0f : 24.0f);
-        uniforms.cursorSize = (vector_float2){cursorBase * 0.75f,
-                                              cursorBase * 1.1875f};
-        uniforms.cursorVisible = cursorVisible ? 1u : 0u;
-        uniforms.cursorType = (uint32_t)MAX(0, cursorType);
-        uniforms.cursorLarge = cursorLarge ? 1u : 0u;
+        uniforms.cursorExtent = (vector_float2){
+            (float)_cursorPointSizes[type].width * drawScale,
+            (float)_cursorPointSizes[type].height * drawScale
+        };
+        uniforms.cursorVisible = (cursorVisible && cursorTexture) ? 1u : 0u;
         const OSType format = CVPixelBufferGetPixelFormatType(pixelBuffer);
         uniforms.fullRange =
             format == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange ? 1u : 0u;
@@ -471,6 +548,7 @@ static BOOL tb_pixel_buffer_uses_display_p3(CVPixelBufferRef pixelBuffer) {
         [encoder setRenderPipelineState:_pipeline];
         [encoder setFragmentTexture:lumaTexture atIndex:0];
         [encoder setFragmentTexture:chromaTexture atIndex:1];
+        if (cursorTexture) [encoder setFragmentTexture:cursorTexture atIndex:2];
         [encoder setFragmentBytes:&uniforms length:sizeof(uniforms) atIndex:0];
         [encoder drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
         [encoder endEncoding];
