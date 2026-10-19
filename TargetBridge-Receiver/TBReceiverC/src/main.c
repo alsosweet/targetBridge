@@ -2278,13 +2278,16 @@ int main(int argc, char **argv) {
             }
         }
 
-        /* Yield when idle or when a nonblocking active socket had no data,
-         * otherwise the receiver can busy-spin between incoming frame packets.
-         * Block in poll() on the active socket (or the listener) instead of a
-         * fixed 1 ms sleep: a packet wakes us immediately, while an idle loop
-         * only wakes every idle_poll_ms (SDL/CFRunLoop housekeeping) or when a
-         * dirty cursor becomes eligible for its rate-limited present. */
-        if (a.client_fd < 0 || !a.have_video_frame || socket_activity == 0) {
+        /* Wait for the next socket segment in poll() instead of sleeping a
+         * fixed 1 ms or spinning: a packet wakes us immediately, an idle loop
+         * only wakes every idle_poll_ms (SDL/CFRunLoop housekeeping), and a
+         * dirty cursor shortens the wait to the moment its rate-limited
+         * present becomes eligible. This also applies right after a productive
+         * drain: a 5K frame arrives as a burst of segments, and re-running the
+         * SDL event pump and CFRunLoop between two segments of the same frame
+         * is pure overhead. */
+        (void)socket_activity;
+        {
             int timeout_ms = (int)a.idle_poll_ms;
             if (a.client_fd >= 0 && a.have_video_frame) {
                 const uint32_t cursor_wait = tb_disp_cursor_wait_ms(a.disp);
