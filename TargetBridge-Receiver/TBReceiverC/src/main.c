@@ -63,6 +63,8 @@ struct app {
 
     int      server_fd;
     uint32_t idle_poll_ms;   /* max idle wait per loop pass (TB_RECEIVER_IDLE_POLL_MS) */
+    uint32_t event_pump_ms;  /* min interval between SDL/CFRunLoop pumps (TB_RECEIVER_EVENT_PUMP_MS) */
+    uint64_t last_pump_ms;
     int      client_fd;
 
     uint64_t frames;
@@ -1988,7 +1990,17 @@ int main(int argc, char **argv) {
             if (v >= 1 && v <= 100) a.idle_poll_ms = (uint32_t)v;
         }
     }
-    fprintf(stderr, "[main] idle poll interval = %u ms\n", (unsigned)a.idle_poll_ms);
+    a.event_pump_ms = 4;
+    a.last_pump_ms = 0;
+    {
+        const char *env = getenv("TB_RECEIVER_EVENT_PUMP_MS");
+        if (env && *env) {
+            long v = strtol(env, NULL, 10);
+            if (v >= 0 && v <= 50) a.event_pump_ms = (uint32_t)v;
+        }
+    }
+    fprintf(stderr, "[main] idle poll interval = %u ms, event pump interval = %u ms\n",
+            (unsigned)a.idle_poll_ms, (unsigned)a.event_pump_ms);
     a.client_fd = -1;
     {
         char host[96] = {0};
@@ -2048,9 +2060,20 @@ int main(int argc, char **argv) {
     a.last_ip_check_ms = 0;
 
     while (!g_term) {
-        unsigned int disp_actions = tb_disp_poll_actions(a.disp);
+        /* Pump SDL/CFRunLoop at most every event_pump_ms: with poll()-driven
+         * wakeups the loop runs once per incoming TCP segment (~1-3k/s on a 5K
+         * stream), and each pump is a round of mach_msg traffic to the
+         * WindowServer that has nothing to do with video. */
+        unsigned int disp_actions = 0;
         int socket_activity = 0;
-        CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.0, true);
+        {
+            const uint64_t pump_now = now_ms();
+            if (pump_now - a.last_pump_ms >= a.event_pump_ms) {
+                a.last_pump_ms = pump_now;
+                disp_actions = tb_disp_poll_actions(a.disp);
+                CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.0, true);
+            }
+        }
         if (disp_actions & TB_DISP_ACTION_QUIT) break;
         if ((disp_actions & TB_DISP_ACTION_CYCLE_LANGUAGE) && a.client_fd < 0) {
             tb_receiver_cycle_language_preference(&a);
