@@ -1401,6 +1401,14 @@ void tb_disp_set_cursor(struct tb_display *d,
     }
 }
 
+uint32_t tb_disp_cursor_wait_ms(const struct tb_display *d) {
+    if (!d || !d->cursor_dirty || !d->is_connected) return UINT32_MAX;
+    const uint64_t now = SDL_GetTicks64();
+    const uint64_t elapsed = now - d->last_present_ms;
+    if (elapsed >= d->cursor_min_present_ms) return 0;
+    return (uint32_t)(d->cursor_min_present_ms - elapsed);
+}
+
 void tb_disp_present_cursor_if_dirty(struct tb_display *d) {
     if (!d || !d->cursor_dirty || !d->is_connected) return;
     const uint64_t now = SDL_GetTicks64();

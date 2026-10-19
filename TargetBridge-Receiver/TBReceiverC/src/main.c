@@ -37,6 +37,7 @@
 #endif
 
 #include <errno.h>
+#include <poll.h>
 #include <limits.h>
 #include <signal.h>
 #include <stdint.h>
@@ -61,6 +62,7 @@ struct app {
     struct tb_parser   parser;
 
     int      server_fd;
+    uint32_t idle_poll_ms;   /* max idle wait per loop pass (TB_RECEIVER_IDLE_POLL_MS) */
     int      client_fd;
 
     uint64_t frames;
@@ -1978,6 +1980,15 @@ int main(int argc, char **argv) {
     struct app a;
     memset(&a, 0, sizeof(a));
     a.server_fd = -1;
+    a.idle_poll_ms = 8;
+    {
+        const char *env = getenv("TB_RECEIVER_IDLE_POLL_MS");
+        if (env && *env) {
+            long v = strtol(env, NULL, 10);
+            if (v >= 1 && v <= 100) a.idle_poll_ms = (uint32_t)v;
+        }
+    }
+    fprintf(stderr, "[main] idle poll interval = %u ms\n", (unsigned)a.idle_poll_ms);
     a.client_fd = -1;
     {
         char host[96] = {0};
@@ -2268,9 +2279,29 @@ int main(int argc, char **argv) {
         }
 
         /* Yield when idle or when a nonblocking active socket had no data,
-         * otherwise the receiver can busy-spin between incoming frame packets. */
+         * otherwise the receiver can busy-spin between incoming frame packets.
+         * Block in poll() on the active socket (or the listener) instead of a
+         * fixed 1 ms sleep: a packet wakes us immediately, while an idle loop
+         * only wakes every idle_poll_ms (SDL/CFRunLoop housekeeping) or when a
+         * dirty cursor becomes eligible for its rate-limited present. */
         if (a.client_fd < 0 || !a.have_video_frame || socket_activity == 0) {
-            SDL_Delay(1);
+            int timeout_ms = (int)a.idle_poll_ms;
+            if (a.client_fd >= 0 && a.have_video_frame) {
+                const uint32_t cursor_wait = tb_disp_cursor_wait_ms(a.disp);
+                if (cursor_wait != UINT32_MAX) {
+                    const int w = cursor_wait < 1 ? 1 : (int)cursor_wait;
+                    if (w < timeout_ms) timeout_ms = w;
+                }
+            }
+            struct pollfd pfd;
+            pfd.fd = a.client_fd >= 0 ? a.client_fd : a.server_fd;
+            pfd.events = POLLIN;
+            pfd.revents = 0;
+            if (pfd.fd >= 0) {
+                (void)poll(&pfd, 1, timeout_ms);
+            } else {
+                SDL_Delay((uint32_t)timeout_ms);
+            }
         }
     }
 

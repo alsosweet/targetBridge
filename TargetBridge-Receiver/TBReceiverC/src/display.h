@@ -68,6 +68,8 @@ void tb_disp_set_cursor(struct tb_display *d,
  * minimum present interval; reuses the uploaded texture. Call once per main
  * loop pass, outside the socket drain. */
 void tb_disp_present_cursor_if_dirty(struct tb_display *d);
+/* Milliseconds until a dirty cursor may be presented: 0 = now, UINT32_MAX = nothing pending. */
+uint32_t tb_disp_cursor_wait_ms(const struct tb_display *d);
 
 /* Fetch and reset cursor-present counters (count, avg/max ms between a cursor
  * update arriving and its present). Returns nonzero if count > 0. */
