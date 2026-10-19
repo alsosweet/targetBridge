@@ -160,6 +160,8 @@ static BOOL tb_pixel_buffer_uses_display_p3(CVPixelBufferRef pixelBuffer) {
     CVMetalTextureCacheRef _textureCache;
     TBNativeMetalView *_view;
     CAMetalLayer *_metalLayer;
+    NSView *_sdlContentView;   /* SDL's view, swapped out while we own the window (TB_RECEIVER_METAL_OWN_WINDOW=1) */
+    NSWindow *_ownedWindow;
     CGColorSpaceRef _layerColorSpace;
     dispatch_semaphore_t _inflightSemaphore;
     CVPixelBufferRef _latestFrame;
@@ -334,6 +336,7 @@ static NSCursor *tb_native_cursor_for_type(int type) {
     NSView *contentView = window.contentView;
     if (!contentView) return NO;
     if (_view.window == window && _view.superview == contentView && _metalLayer) return YES;
+    if (_ownedWindow == window && window.contentView == _view && _metalLayer) return YES;
 
     /* SDL may replace its Cocoa window while entering its fullscreen Space.
      * Follow the largest visible receiver window instead of retaining the
@@ -376,7 +379,7 @@ static NSCursor *tb_native_cursor_for_type(int type) {
         _metalLayer.maximumDrawableCount = 3;
     }
     if ([_metalLayer respondsToSelector:@selector(setDisplaySyncEnabled:)]) {
-        _metalLayer.displaySyncEnabled = NO;
+        _metalLayer.displaySyncEnabled = tb_metal_display_sync_enabled();
     }
     fprintf(stderr,
             "[metal-native] attached window=%ld points=%.0fx%.0f scale=%.1f title=%s\n",
@@ -386,6 +389,29 @@ static NSCursor *tb_native_cursor_for_type(int type) {
             window.backingScaleFactor,
             window.title.UTF8String ?: "");
     return YES;
+}
+
+/* TB_RECEIVER_METAL_OWN_WINDOW=1: while video is visible, make the Metal view
+ * the window's content view instead of a sublayer above SDL's OpenGL view, so
+ * the window has a single opaque full-screen layer (direct-to-display
+ * candidate). SDL's view is put back when the stream goes away. */
+static BOOL tb_metal_own_window_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *env = getenv("TB_RECEIVER_METAL_OWN_WINDOW");
+        cached = (env && *env && strcmp(env, "0") != 0) ? 1 : 0;
+    }
+    return cached == 1;
+}
+
+/* TB_RECEIVER_METAL_DISPLAY_SYNC=1 keeps CAMetalLayer vsync on (default off). */
+static BOOL tb_metal_display_sync_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *env = getenv("TB_RECEIVER_METAL_DISPLAY_SYNC");
+        cached = (env && *env && strcmp(env, "0") != 0) ? 1 : 0;
+    }
+    return cached == 1;
 }
 
 /* TB_RECEIVER_METAL_COLORSPACE=none leaves the layer without an explicit color
@@ -435,12 +461,32 @@ static BOOL tb_metal_colorspace_disabled(void) {
     @autoreleasepool {
         if (visible) {
             if ([self attachViewIfNeeded]) {
+                if (tb_metal_own_window_enabled() && !_ownedWindow && _view.window) {
+                    NSWindow *window = _view.window;
+                    _sdlContentView = window.contentView;
+                    [_view removeFromSuperview];
+                    _view.frame = _sdlContentView.frame;
+                    window.contentView = _view;
+                    _ownedWindow = window;
+                    fprintf(stderr, "[metal-native] Metal view now owns window %ld content view (SDL view parked)\n",
+                            (long)window.windowNumber);
+                }
                 [self updateDrawableSize];
                 _view.hidden = NO;
             }
             return;
         }
 
+        if (_ownedWindow && _sdlContentView) {
+            NSWindow *window = _ownedWindow;
+            window.contentView = _sdlContentView;
+            [_sdlContentView addSubview:_view positioned:NSWindowAbove relativeTo:nil];
+            _view.frame = _sdlContentView.bounds;
+            fprintf(stderr, "[metal-native] SDL view restored as window %ld content view\n",
+                    (long)window.windowNumber);
+            _ownedWindow = nil;
+            _sdlContentView = nil;
+        }
         if (_view) _view.hidden = YES;
         if (_latestFrame) {
             CVPixelBufferRelease(_latestFrame);
