@@ -457,20 +457,24 @@ static BOOL tb_metal_colorspace_disabled(void) {
     }
 }
 
+- (void)takeOverWindowIfRequested {
+    if (!tb_metal_own_window_enabled() || _ownedWindow || !_view.window) return;
+    NSWindow *window = _view.window;
+    if (window.contentView == _view) { _ownedWindow = window; return; }
+    _sdlContentView = window.contentView;
+    [_view removeFromSuperview];
+    _view.frame = _sdlContentView.frame;
+    window.contentView = _view;
+    _ownedWindow = window;
+    fprintf(stderr, "[metal-native] Metal view now owns window %ld content view (SDL view parked)\n",
+            (long)window.windowNumber);
+}
+
 - (void)setVisible:(BOOL)visible {
     @autoreleasepool {
         if (visible) {
             if ([self attachViewIfNeeded]) {
-                if (tb_metal_own_window_enabled() && !_ownedWindow && _view.window) {
-                    NSWindow *window = _view.window;
-                    _sdlContentView = window.contentView;
-                    [_view removeFromSuperview];
-                    _view.frame = _sdlContentView.frame;
-                    window.contentView = _view;
-                    _ownedWindow = window;
-                    fprintf(stderr, "[metal-native] Metal view now owns window %ld content view (SDL view parked)\n",
-                            (long)window.windowNumber);
-                }
+                [self takeOverWindowIfRequested];
                 [self updateDrawableSize];
                 _view.hidden = NO;
             }
@@ -512,6 +516,7 @@ static BOOL tb_metal_colorspace_disabled(void) {
            rememberFrame:(BOOL)rememberFrame {
     @autoreleasepool {
         if (!pixelBuffer || ![self attachViewIfNeeded]) return -1;
+        [self takeOverWindowIfRequested];
         [self updateDrawableSize];
         [self updateColorSpaceForPixelBuffer:pixelBuffer];
         _view.hidden = NO;
