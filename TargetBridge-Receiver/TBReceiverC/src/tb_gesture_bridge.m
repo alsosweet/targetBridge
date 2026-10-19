@@ -141,9 +141,21 @@ static void tb_remove_monitor_shield_observers(void) {
     g_monitor_shield_observers = nil;
 }
 
+/* TB_RECEIVER_MONITOR_SHIELD=0 keeps the receiver window at the normal level
+ * (experiment: an elevated window level may disqualify direct-to-display). */
+static BOOL tb_monitor_shield_disabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *env = getenv("TB_RECEIVER_MONITOR_SHIELD");
+        cached = (env && strcmp(env, "0") == 0) ? 1 : 0;
+        if (cached) fprintf(stderr, "[display] monitor shield disabled (TB_RECEIVER_MONITOR_SHIELD=0)\n");
+    }
+    return cached == 1;
+}
+
 void tb_receiver_set_monitor_shield(int active) {
     @autoreleasepool {
-        BOOL normalized = active ? YES : NO;
+        BOOL normalized = (active && !tb_monitor_shield_disabled()) ? YES : NO;
         BOOL changed = normalized != g_monitor_shield_active;
         // Repeated input-state refreshes must not invalidate pending retries.
         if (!changed) {
