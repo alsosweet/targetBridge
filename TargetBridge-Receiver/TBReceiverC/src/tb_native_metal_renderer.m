@@ -359,7 +359,7 @@ static NSCursor *tb_native_cursor_for_type(int type) {
     if (![_metalLayer isKindOfClass:CAMetalLayer.class]) return NO;
     _metalLayer.device = _device;
     _metalLayer.pixelFormat = MTLPixelFormatBGRA8Unorm;
-    CGColorSpaceRef srgb = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+    CGColorSpaceRef srgb = tb_metal_colorspace_disabled() ? NULL : CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
     if (srgb) {
         _metalLayer.colorspace = srgb;
         /* CAMetalLayer's CF-typed property does not declare ownership in the
@@ -388,8 +388,22 @@ static NSCursor *tb_native_cursor_for_type(int type) {
     return YES;
 }
 
+/* TB_RECEIVER_METAL_COLORSPACE=none leaves the layer without an explicit color
+ * space: the WindowServer then has no color matching to do, which is one of
+ * the conditions for direct-to-display presentation (no compositing pass). */
+static BOOL tb_metal_colorspace_disabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *env = getenv("TB_RECEIVER_METAL_COLORSPACE");
+        cached = (env && strcmp(env, "none") == 0) ? 1 : 0;
+        if (cached) fprintf(stderr, "[metal-native] layer color space disabled (TB_RECEIVER_METAL_COLORSPACE=none)\n");
+    }
+    return cached == 1;
+}
+
 - (void)updateColorSpaceForPixelBuffer:(CVPixelBufferRef)pixelBuffer {
     if (!_metalLayer) return;
+    if (tb_metal_colorspace_disabled()) return;
     const BOOL displayP3 = tb_pixel_buffer_uses_display_p3(pixelBuffer);
     if (_metalLayer.colorspace && displayP3 == _displayP3) return;
 
