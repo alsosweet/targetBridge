@@ -21,6 +21,10 @@ void *tb_native_metal_create(void);
 void  tb_native_metal_destroy(void *renderer);
 void  tb_native_metal_set_visible(void *renderer, int visible);
 
+/* Hide the local macOS pointer over the Metal view while it owns the window
+ * (mirrors SDL_ShowCursor(SDL_DISABLE) on SDL's parked content view). */
+void  tb_native_metal_set_system_cursor_hidden(int hidden);
+
 /* Returns 1 when submitted, 0 for a temporary queue/drawable drop and -1
  * when the native renderer cannot handle the frame. */
 int tb_native_metal_render_nv12(void *renderer,

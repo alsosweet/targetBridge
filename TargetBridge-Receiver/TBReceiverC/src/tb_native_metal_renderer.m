@@ -10,6 +10,17 @@
 #include <stdio.h>
 #include <string.h>
 
+static int tb_native_metal_system_cursor_hidden = 0;
+
+static NSCursor *tb_native_metal_invisible_cursor(void) {
+    static NSCursor *cursor = nil;
+    if (!cursor) {
+        NSImage *image = [[NSImage alloc] initWithSize:NSMakeSize(16, 16)];
+        cursor = [[NSCursor alloc] initWithImage:image hotSpot:NSZeroPoint];
+    }
+    return cursor;
+}
+
 @interface TBNativeMetalView : NSView
 @end
 
@@ -27,6 +38,18 @@
 
 - (BOOL)acceptsFirstResponder {
     return NO;
+}
+
+/* While this view is the window's content view (TB_RECEIVER_METAL_OWN_WINDOW),
+ * SDL's own view is parked, so SDL_ShowCursor(SDL_DISABLE) no longer reaches
+ * an on-screen view. Mirror SDL's invisible cursor rect here so the iMac's
+ * local pointer stays hidden over the stream (e.g. after display wake, when
+ * Deskflow's CGDisplayHideCursor has been lost). */
+- (void)resetCursorRects {
+    [super resetCursorRects];
+    if (tb_native_metal_system_cursor_hidden) {
+        [self addCursorRect:self.bounds cursor:tb_native_metal_invisible_cursor()];
+    }
 }
 
 @end
@@ -789,4 +812,18 @@ const char *tb_native_metal_color_space_name(void *renderer) {
     @autoreleasepool {
         return [(__bridge TBNativeMetalRenderer *)renderer colorSpaceName];
     }
+}
+
+void tb_native_metal_set_system_cursor_hidden(int hidden) {
+    hidden = hidden ? 1 : 0;
+    if (tb_native_metal_system_cursor_hidden == hidden) return;
+    tb_native_metal_system_cursor_hidden = hidden;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        for (NSWindow *window in [NSApp windows]) {
+            NSView *content = window.contentView;
+            if ([content isKindOfClass:[TBNativeMetalView class]]) {
+                [window invalidateCursorRectsForView:content];
+            }
+        }
+    });
 }

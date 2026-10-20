@@ -532,6 +532,9 @@ static void tb_disp_refresh_window_mode(struct tb_display *d) {
         d->input_intercept_active;
 
     SDL_ShowCursor(should_hide_cursor ? SDL_DISABLE : SDL_ENABLE);
+#if defined(__APPLE__)
+    tb_native_metal_set_system_cursor_hidden(should_hide_cursor);
+#endif
     if (should_hide_cursor && !d->system_cursor_hidden) {
         CGDisplayHideCursor(CGMainDisplayID());
         d->system_cursor_hidden = 1;
