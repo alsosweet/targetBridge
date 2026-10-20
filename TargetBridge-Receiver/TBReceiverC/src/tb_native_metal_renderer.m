@@ -11,6 +11,51 @@
 #include <string.h>
 
 static int tb_native_metal_system_cursor_hidden = 0;
+/* Extra CGDisplayHideCursor calls we issued after a display wake (the
+ * WindowServer can drop the hidden state on wake); undone on show. */
+static int tb_native_metal_extra_hides = 0;
+static BOOL tb_native_metal_wake_observer_installed = NO;
+
+static void tb_native_metal_refresh_cursor_rects(void) {
+    for (NSWindow *window in [NSApp windows]) {
+        NSView *content = window.contentView;
+        if ([content isKindOfClass:NSClassFromString(@"TBNativeMetalView")]) {
+            [window invalidateCursorRectsForView:content];
+        }
+    }
+}
+
+static void tb_native_metal_reassert_hidden_cursor(const char *why) {
+    if (!tb_native_metal_system_cursor_hidden) return;
+    tb_native_metal_refresh_cursor_rects();
+    if (CGCursorIsVisible()) {
+        CGDisplayHideCursor(CGMainDisplayID());
+        tb_native_metal_extra_hides++;
+        fprintf(stderr, "[metal-native] system cursor was visible (%s); re-hidden (extra hides=%d)\n",
+                why, tb_native_metal_extra_hides);
+    }
+}
+
+static void tb_native_metal_install_wake_observer(void) {
+    if (tb_native_metal_wake_observer_installed) return;
+    tb_native_metal_wake_observer_installed = YES;
+    void (^onWake)(NSNotification *) = ^(NSNotification *note) {
+        (void)note;
+        const double delays[] = {0.5, 2.0, 5.0};
+        for (size_t i = 0; i < sizeof(delays) / sizeof(delays[0]); i++) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delays[i] * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                tb_native_metal_reassert_hidden_cursor("after display wake");
+            });
+        }
+    };
+    [[[NSWorkspace sharedWorkspace] notificationCenter]
+        addObserverForName:NSWorkspaceScreensDidWakeNotification
+                    object:nil queue:[NSOperationQueue mainQueue] usingBlock:onWake];
+    [[NSNotificationCenter defaultCenter]
+        addObserverForName:NSApplicationDidChangeScreenParametersNotification
+                    object:nil queue:[NSOperationQueue mainQueue] usingBlock:onWake];
+}
 
 static NSCursor *tb_native_metal_invisible_cursor(void) {
     static NSCursor *cursor = nil;
@@ -489,6 +534,9 @@ static BOOL tb_metal_colorspace_disabled(void) {
     _view.frame = _sdlContentView.frame;
     window.contentView = _view;
     _ownedWindow = window;
+    /* AppKit does not rebuild cursor rects on a contentView swap. */
+    [window invalidateCursorRectsForView:_view];
+    tb_native_metal_install_wake_observer();
     fprintf(stderr, "[metal-native] Metal view now owns window %ld content view (SDL view parked)\n",
             (long)window.windowNumber);
 }
@@ -819,10 +867,11 @@ void tb_native_metal_set_system_cursor_hidden(int hidden) {
     if (tb_native_metal_system_cursor_hidden == hidden) return;
     tb_native_metal_system_cursor_hidden = hidden;
     dispatch_async(dispatch_get_main_queue(), ^{
-        for (NSWindow *window in [NSApp windows]) {
-            NSView *content = window.contentView;
-            if ([content isKindOfClass:[TBNativeMetalView class]]) {
-                [window invalidateCursorRectsForView:content];
+        tb_native_metal_refresh_cursor_rects();
+        if (!tb_native_metal_system_cursor_hidden) {
+            while (tb_native_metal_extra_hides > 0) {
+                CGDisplayShowCursor(CGMainDisplayID());
+                tb_native_metal_extra_hides--;
             }
         }
     });
